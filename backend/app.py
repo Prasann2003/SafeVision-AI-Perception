@@ -22,8 +22,7 @@ def process_media():
     if 'file' not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     
-    # --- AUTOMATIC CLEANUP INJECTED HERE ---
-    # This securely deletes old test frames/videos from the directory before processing
+    # --- AUTOMATIC CLEANUP ---
     if os.path.exists(RESULT_FOLDER):
         for filename in os.listdir(RESULT_FOLDER):
             file_path = os.path.join(RESULT_FOLDER, filename)
@@ -50,18 +49,32 @@ def process_media():
             det_img = results[0].plot()
             cv2.imwrite(os.path.join(RESULT_FOLDER, "detection.jpg"), det_img)
             
-            # XAI Heatmap Logic (Gaussian Intensity)
+            # --- OPTIMIZED HEATMAP LOGIC ---
             raw_img = cv2.imread(input_path)
-            heatmap = np.zeros((raw_img.shape[0], raw_img.shape[1]), dtype=np.uint8)
+            height, width = raw_img.shape[0], raw_img.shape[1]
+            heatmap = np.zeros((height, width), dtype=np.float32)
+            
             for box in results[0].boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 conf = float(box.conf[0])
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                cv2.circle(heatmap, (cx, cy), (x2-x1)//2, int(255 * conf), -1)
+                
+                # Create localized bounding box regions with fall-off intensity centers
+                box_w, box_h = x2 - x1, y2 - y1
+                if box_w > 0 and box_h > 0:
+                    # Form a refined Gaussian-like focus within the object's physical grid boundary
+                    grid_y, grid_x = np.mgrid[0:box_h, 0:box_w]
+                    cy, cx = box_h / 2.0, box_w / 2.0
+                    sigma_x, sigma_y = box_w / 3.0, box_h / 3.0
+                    
+                    # Calculate structured mathematical intensity centered inside the object box
+                    gaussian = np.exp(-(((grid_x - cx) ** 2 / (2 * sigma_x ** 2)) + ((grid_y - cy) ** 2 / (2 * sigma_y ** 2))))
+                    heatmap[y1:y2, x1:x2] = np.maximum(heatmap[y1:y2, x1:x2], gaussian * conf)
             
-            heatmap = cv2.GaussianBlur(heatmap, (51, 51), 0)
+            # Use a tightened blur kernel to keep feature activations bound specifically to objects
+            heatmap = np.uint8(255 * heatmap)
+            heatmap = cv2.GaussianBlur(heatmap, (21, 21), 0)
             heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-            xai_img = cv2.addWeighted(raw_img, 0.5, heatmap_color, 0.5, 0)
+            xai_img = cv2.addWeighted(raw_img, 0.6, heatmap_color, 0.4, 0)
             cv2.imwrite(os.path.join(RESULT_FOLDER, "xai.jpg"), xai_img)
 
             latency = round((time.time() - start_time) * 1000, 2)
@@ -96,14 +109,23 @@ def process_media():
                 out.write(res[0].plot())
                 
                 if not first_frame_xai_done:
-                    # Generate XAI for the first frame to display on dashboard
-                    hm = np.zeros((height, width), dtype=np.uint8)
+                    # Generate optimized XAI for the first video frame
+                    hm = np.zeros((height, width), dtype=np.float32)
                     for b in res[0].boxes:
-                        coords = map(int, b.xyxy[0])
-                        x1, y1, x2, y2 = coords
-                        cv2.circle(hm, ((x1+x2)//2, (y1+y2)//2), (x2-x1)//2, 255, -1)
-                    hm = cv2.applyColorMap(cv2.GaussianBlur(hm, (51, 51), 0), cv2.COLORMAP_JET)
-                    cv2.imwrite(os.path.join(RESULT_FOLDER, "xai_video.jpg"), cv2.addWeighted(frame, 0.5, hm, 0.5, 0))
+                        x1, y1, x2, y2 = map(int, b.xyxy[0])
+                        c_conf = float(b.conf[0])
+                        bw, bh = x2 - x1, y2 - y1
+                        if bw > 0 and bh > 0:
+                            gy, gx = np.mgrid[0:bh, 0:bw]
+                            g_cy, g_cx = bh / 2.0, bw / 2.0
+                            s_x, s_y = bw / 3.0, bh / 3.0
+                            g_val = np.exp(-(((gx - g_cx) ** 2 / (2 * s_x ** 2)) + ((gy - g_cy) ** 2 / (2 * s_y ** 2))))
+                            hm[y1:y2, x1:x2] = np.maximum(hm[y1:y2, x1:x2], g_val * c_conf)
+                    
+                    hm = np.uint8(255 * hm)
+                    hm = cv2.GaussianBlur(hm, (21, 21), 0)
+                    hm_color = cv2.applyColorMap(hm, cv2.COLORMAP_JET)
+                    cv2.imwrite(os.path.join(RESULT_FOLDER, "xai_video.jpg"), cv2.addWeighted(frame, 0.6, hm_color, 0.4, 0))
                     first_frame_xai_done = True
                 
                 total_boxes += len(res[0].boxes)
